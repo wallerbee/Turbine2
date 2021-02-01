@@ -1,0 +1,193 @@
+var table = ee.FeatureCollection("users/ericwaller/uswtdbSHP"),
+    table2 = ee.FeatureCollection("users/ericwaller/f60Clipped_South"),
+    table3 = ee.FeatureCollection("users/ericwaller/f120Clipped_South");
+    
+var f60Clipped = table2;
+var f120Clipped = table3;
+
+//var extent = ee.Geometry.Point([-118.26,35.12]).buffer(40000);
+var extent = ee.Geometry.Point([-116.63,33.92]).buffer(20000);
+
+//Still using the wind database for the core 45 meter buffer
+var table = table.filterBounds(extent);
+
+//var table = table.filter(ee.Filter.eq('t_state', 'CA')); // gets everything?
+var table = table.filter(ee.Filter.gte('p_year', 1988));
+//var table = table.filter(ee.Filter.gte('p_year', 1994));
+var table = table.filter(ee.Filter.lte('p_year', 2013));
+
+// Buffer turbine sites (table) and use percentile approach on NDVI to create mask
+
+var AllBuff45 = table.map(function f(e) {
+  return e.buffer(45);
+});
+
+/// BEGINNING TIME SERIES PROCESSING of L5 IMAGERY (1984-2011)
+
+var cloudMaskL457 = function(image) {
+  var qa = image.select('pixel_qa');
+  // If the cloud bit (5) is set and the cloud confidence (7) is high
+  // or the cloud shadow bit is set (3), then it's a bad pixel.
+  var cloud = qa.bitwiseAnd(1 << 5)
+          .and(qa.bitwiseAnd(1 << 7))
+          .or(qa.bitwiseAnd(1 << 3))
+  // Remove edge pixels that don't occur in all bands
+  var mask2 = image.mask().reduce(ee.Reducer.min());
+  return image.updateMask(cloud.not()).updateMask(mask2);
+};
+
+// Map the function over the collection
+var L5coll = ee.ImageCollection('LANDSAT/LT05/C01/T1_SR')
+    .filterBounds(extent).filterDate('1984-01-01', '2011-12-31')
+
+var L5masked = L5coll
+    .map(cloudMaskL457);
+    
+var L7coll = ee.ImageCollection('LANDSAT/LE07/C01/T1_SR')
+  .filterDate('2011-01-01','2018-12-31')
+
+var L7masked = L7coll
+    .map(cloudMaskL457);
+    
+// Calculate indices for L5 and L7 (could've merged collections before this)
+
+var L5ind = L5masked.map(function(image) {
+  var ndvi = image.normalizedDifference(['B4', 'B3']).rename('ndvi');
+  var B7 = image.select('B7');
+  var B5 = image.select('B5');
+  var B3 = image.select('B3');
+  var satvi = ((B5.subtract(B3)).divide(B5.add(B3).add(9000)).multiply(1.9)).subtract(B7.divide(20000)).rename('satvi');
+  return image.select().addBands([ndvi,satvi]);
+});
+
+var L7ind = L7masked.map(function(image) {
+  var ndvi = image.normalizedDifference(['B4', 'B3']).rename('ndvi');
+  var B7 = image.select('B7');
+  var B5 = image.select('B5');
+  var B3 = image.select('B3');
+  var satvi = ((B5.subtract(B3)).divide(B5.add(B3).add(9000)).multiply(1.9)).subtract(B7.divide(20000)).rename('satvi');
+  return image.select().addBands([ndvi,satvi]);
+});
+
+//  LANDSAT 8 with different processing(I removed earlier L8 masking code that divides by 10000)
+//***************************************************************************
+// // Function to cloud mask from the pixel_qa band of Landsat 8 SR data.
+// function maskL8sr(image) {
+//   // Bits 3 and 5 are cloud shadow and cloud, respectively.
+//   var cloudShadowBitMask = 1 << 3;
+//   var cloudsBitMask = 1 << 5;
+//   // Get the pixel QA band.
+//   var qa = image.select('pixel_qa');
+//   // Both flags should be set to zero, indicating clear conditions.
+//   var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0)
+//       .and(qa.bitwiseAnd(cloudsBitMask).eq(0));
+//   // Return the masked image, scaled to TOA reflectance, without the QA bands.
+//   return image.updateMask(mask)
+//       .select("B[0-9]*")
+//       .copyProperties(image, ["system:time_start"]);
+// }
+
+//// Map the function over one year of data.
+// var L8masked = ee.ImageCollection('LANDSAT/LC08/C01/T1_SR')
+//     .filterDate('2013-01-01', '2018-12-31')
+//     .map(maskL8sr)
+
+// var L8ind = L5masked.map(function(image) {
+//   var ndvi = image.normalizedDifference(['B5', 'B4']).rename('ndvi');
+//   var B7 = image.select('B7');
+//   var B6 = image.select('B6');
+//   var B4 = image.select('B4');
+//   var satvi = ((B6.subtract(B4)).divide(B6.add(B4).add(9000)).multiply(1.9)).subtract(B7.divide(20000)).rename('satvi');
+//   return image.select().addBands([ndvi,satvi]);
+// });
+
+// Merge the indices from the 2 collections (note the removal of L8)
+var L57ind = ee.ImageCollection(L5ind.merge(L7ind));
+
+
+///////////////////////////
+// Reduce by collections //
+///////////////////////////
+var years = ee.List.sequence(1984, 2018);
+
+// Group by Year, and then reduce within groups by mean();
+// the result is an ImageCollection with one image for each
+// Year.
+var byYear = ee.ImageCollection.fromImages(
+      years.map(function (y) {
+        var yrdata = L57ind.filter(ee.Filter.calendarRange(y, y, 'year'))
+        var sprdata = yrdata.filter(ee.Filter.calendarRange(1, 6, 'month')).max();
+        var smrdata = yrdata.filter(ee.Filter.calendarRange(7, 10, 'month')).median();
+        var invind = sprdata.subtract(smrdata);
+        return invind.set('year', y);
+}));
+
+
+var firstyr = byYear.first();
+Map.addLayer(firstyr, {bands: 'satvi', min:-0.1, max: 0.1}, 'first');
+
+// Core means and medians  {YEAR can be inferred in the results with the beginning number of the System:Index -> e.g., 0=1984, 27=2011}
+var core_L5means = ee.FeatureCollection(byYear.map(function(img) {
+return img.select(["ndvi",'satvi']).rename(['core_ndvi_mean','core_satvi_mean']).reduceRegions({collection: AllBuff45, scale:30,
+                                  reducer: ee.Reducer.mean() 
+  })}));
+
+var core_L5meds = ee.FeatureCollection(byYear.map(function(img) {
+  return img.select(["ndvi",'satvi']).rename(['core_ndvi_median','core_satvi_median']).reduceRegions({collection: AllBuff45,scale:30,
+                                  reducer: ee.Reducer.median()
+  })}));
+
+// Inner means and medians
+var inner_L5means = ee.FeatureCollection(byYear.map(function(img) {
+  // var dateStr = img.date();
+  // var dateNum = ee.Number.parse(dateStr.format("YYYYMMdd"));
+  // img = img.addBands(ee.Image(dateNum).rename('date'));
+return img.select(["ndvi",'satvi']).rename(['inner_ndvi_mean','inner_satvi_mean']).reduceRegions({collection: f60Clipped,scale:30,
+                                  reducer: ee.Reducer.mean() 
+  })}));
+
+var inner_L5meds = ee.FeatureCollection(byYear.map(function(img) {
+  return img.select(["ndvi",'satvi']).rename(['inner_ndvi_median','inner_satvi_median']).reduceRegions({collection: f60Clipped,scale:30,
+                                  reducer: ee.Reducer.median()
+  })}));
+
+var outer_L5means = ee.FeatureCollection(byYear.map(function(img) {
+return img.select(["ndvi",'satvi']).rename(['outer_ndvi_mean','outer_satvi_mean']).reduceRegions({collection: f120Clipped,scale:30,
+                                  reducer: ee.Reducer.mean() 
+  })}));
+
+var outer_L5meds = ee.FeatureCollection(byYear.map(function(img) {
+  return img.select(["ndvi",'satvi']).rename(['outer_ndvi_median','outer_satvi_median']).reduceRegions({collection: f120Clipped,scale:30,
+                                  reducer: ee.Reducer.median()
+  })}));
+
+// flatten collection of collections
+var core_L5mean_flat = core_L5means.flatten();
+var core_L5med_flat = core_L5meds.flatten();
+var inner_L5mean_flat = inner_L5means.flatten();
+var inner_L5med_flat = inner_L5meds.flatten();
+var outer_L5mean_flat = outer_L5means.flatten();
+var outer_L5med_flat = outer_L5meds.flatten();
+
+//null removal
+var coreL5mean_ff = core_L5mean_flat.filter(ee.Filter.neq('core_ndvi_mean', null)).select(['core_ndvi_mean','core_satvi_mean','case_id']); 
+var coreL5median_ff = core_L5med_flat.filter(ee.Filter.neq('core_ndvi_median', null)).select(['core_ndvi_median','core_satvi_median','case_id']);
+var innerL5mean_ff = inner_L5mean_flat.filter(ee.Filter.neq('inner_ndvi_mean', null)).select(['inner_ndvi_mean','inner_satvi_mean','case_id']); 
+var innerL5median_ff = inner_L5med_flat.filter(ee.Filter.neq('inner_ndvi_median', null)).select(['inner_ndvi_median','inner_satvi_median','case_id']);
+var outerL5mean_ff = outer_L5mean_flat.filter(ee.Filter.neq('outer_ndvi_mean', null)).select(['outer_ndvi_mean','outer_satvi_mean','case_id']); 
+var outerL5median_ff = outer_L5med_flat.filter(ee.Filter.neq('outer_ndvi_median', null)).select(['outer_ndvi_median','outer_satvi_median','case_id']);
+
+//EXPORT
+Export.table.toDrive(coreL5mean_ff.select([".*"], null, false), 'Inv_coreL57mean_8418_South');
+Export.table.toDrive(coreL5median_ff.select([".*"], null, false), 'Inv_coreL57median_8418_South');
+Export.table.toDrive(innerL5mean_ff.select([".*"], null, false), 'Inv_innerL57mean_8418_South');
+Export.table.toDrive(innerL5median_ff.select([".*"], null, false), 'Inv_innerL57median_8418_South');
+Export.table.toDrive(outerL5mean_ff.select([".*"], null, false), 'Inv_outerL57mean_8418_South');
+Export.table.toDrive(outerL5median_ff.select([".*"], null, false), 'Inv_outerL57median_8418_South');
+
+// END
+
+
+
+
+
